@@ -81,7 +81,7 @@ The guiding rule is: **the model proposes, the software decides.**
 1. The LLM never connects to the database. It only returns structured JSON that describes either a plan, a tool call (tool name and arguments), or a final answer.
 2. `ResponseParser` converts that JSON into typed objects (`QueryPlan`, `AgentAction`, `Insight`). Malformed output is rejected and reported back to the model once.
 3. `ToolRegistry` checks that the requested tool exists and that the arguments match the tool's parameter schema before anything runs.
-4. Every SQL statement passes through `SqlValidator`, a chain of deterministic rules that only allows single, read only `SELECT` statements with a row limit. The dataset is also opened in read only mode as a second layer of protection.
+4. Every SQL statement passes through `SqlValidator`, a stack of decorators that only allows single, read only `SELECT` statements with a row limit. The dataset is also opened in read only mode as a second layer of protection.
 5. Tool results are summarized before they are sent back to the model (column names, row count, and at most a small number of rows). This limits token usage and the amount of data shared with external services.
 6. Values stored in the data are always treated as data, never as instructions to the agent.
 7. The final summary is checked by `InsightVerifier`, which confirms every number in the text against the query result.
@@ -111,7 +111,7 @@ flowchart TB
     end
     subgraph D["Data Access and Safety"]
         DS["DataSource (SQLite, CSV)"]
-        V["SqlValidator rule chain"]
+        V["SqlValidator decorators"]
         QE["QueryExecutor, SchemaReader"]
     end
     subgraph OUT["Output, Persistence and Evaluation"]
@@ -278,7 +278,7 @@ AskDB has 15 major features. None of them are account or housekeeping operations
 
 | Field | Specification |
 |---|---|
-| Description | Every SQL statement, whether written by the agent or typed by the user, passes a chain of deterministic rules before execution: read only (`SELECT` or `WITH` only), a single statement, no forbidden objects or commands (`PRAGMA`, `ATTACH`, `load_extension`, system tables), and a maximum row limit. Queries also have an execution timeout, and the database connection is opened read only. |
+| Description | Every SQL statement, whether written by the agent or typed by the user, passes through stacked decorators before execution: read only (`SELECT` or `WITH` only), a single statement, no forbidden objects or commands (`PRAGMA`, `ATTACH`, `load_extension`, system tables), and a maximum row limit. Queries also have an execution timeout, and the database connection is opened read only. |
 | User Interaction | Automatic. Blocked statements show a red banner in the GUI or a message in the CLI with the reason. |
 | Input | SQL text. |
 | Output | A `ValidationResult`: valid (possibly rewritten with a `LIMIT`) or rejected with a reason. |
@@ -318,7 +318,7 @@ AskDB has 15 major features. None of them are account or housekeeping operations
 | User Interaction | GUI: chart under the result table with a chart type selector and Save Image. CLI: `--chart out.png` saves the image and the table is printed in the terminal. |
 | Input | `QueryResult` and the chart hint from the `QueryPlan`. |
 | Output | A `ChartSpec` rendered by `ChartView` or saved by `ChartRenderer`. |
-| AI Involvement | Hybrid. The LLM suggests a chart type; deterministic strategies decide whether it suits the data and render it. |
+| AI Involvement | Hybrid. The LLM suggests a chart type; `ChartFactory` chooses a chart class that fits the data and that class renders it. |
 | Expected Workflow | 1. `MakeChartTool.execute()` calls `ChartRecommender.recommend()`. 2. `ChartFactory.create()` returns the hinted chart class if it fits the result; otherwise it returns the first class that fits. 3. That class builds a `ChartSpec`. 4. The chart is displayed. |
 | Error/Alternative Cases | Unsuitable hint (a pie chart with 40 categories): falls back to bar. A single value result: shown as a value card. No numeric column: table only. Rendering error: the table is shown and the error is logged. |
 
@@ -1010,7 +1010,7 @@ classDiagram
     LLMProviderFactory ..> LLMProvider : creates
     LLMProviderFactory --> AppConfig
     ModelRouter "1" o-- "1..*" LLMProvider
-    ModelRouter "1" --> "1" RoutingPolicy : current strategy
+    ModelRouter "1" --> "1" RoutingPolicy : current state
     RoutingPolicy <|.. CheapFirstPolicy
     RoutingPolicy <|.. StrongOnlyPolicy
     RoutingPolicy <|.. LocalOnlyPolicy
@@ -1154,24 +1154,24 @@ classDiagram
 ```mermaid
 classDiagram
     class ChartFactory {
-        +create(result: QueryResult, hint: str) ChartStrategy
+        +create(result: QueryResult, hint: str) ChartProduct
     }
     class ChartRecommender {
         -factory: ChartFactory
-        +recommend(result: QueryResult, hint: str) ChartStrategy
+        +recommend(result: QueryResult, hint: str) ChartProduct
         +build(result: QueryResult, hint: str) ChartSpec
     }
-    class ChartStrategy {
+    class ChartProduct {
         <<interface>>
         +chart_type() str
         +suits(result: QueryResult) bool
         +render(result: QueryResult) ChartSpec
     }
-    class BarChartStrategy
-    class LineChartStrategy
-    class PieChartStrategy
-    class ScatterChartStrategy
-    class TableOnlyStrategy
+    class BarChart
+    class LineChart
+    class PieChart
+    class ScatterChart
+    class TableChart
     class ChartSpec {
         +chart_type: str
         +title: str
@@ -1306,13 +1306,13 @@ classDiagram
     }
 
     ChartRecommender --> ChartFactory
-    ChartFactory ..> ChartStrategy : creates
-    ChartStrategy <|.. BarChartStrategy
-    ChartStrategy <|.. LineChartStrategy
-    ChartStrategy <|.. PieChartStrategy
-    ChartStrategy <|.. ScatterChartStrategy
-    ChartStrategy <|.. TableOnlyStrategy
-    ChartStrategy ..> ChartSpec : creates
+    ChartFactory ..> ChartProduct : creates
+    ChartProduct <|.. BarChart
+    ChartProduct <|.. LineChart
+    ChartProduct <|.. PieChart
+    ChartProduct <|.. ScatterChart
+    ChartProduct <|.. TableChart
+    ChartProduct ..> ChartSpec : creates
     ChartRenderer ..> ChartSpec : draws
     Dashboard "1" *-- "0..12" DashboardTile
     Dashboard "1" o-- "0..*" DashboardObserver : notifies
@@ -1409,7 +1409,7 @@ AskDB uses seven patterns taught in the course: Facade, Adapter, Observer, Facto
 | Question | Answer |
 |---|---|
 | Design problem | Which concrete class to create depends on runtime input: the file type being imported, the provider named in configuration, the export format, or the chart that fits a result. Clients should depend only on the product interface. |
-| Participating classes | `DataSourceFactory.create(paths)` returns `SQLiteDataSource` or `CsvDataSource`. `LLMProviderFactory.create(name)` returns `GeminiAdapter`, `GroqAdapter`, `OllamaAdapter`, or `MockLLMProvider`. `ExporterFactory.create(fmt)` returns `MarkdownExporter`, `HtmlExporter`, or `PdfExporter`. `ChartFactory.create(result, hint)` returns the first fitting chart class: `LineChartStrategy`, `BarChartStrategy`, `ScatterChartStrategy`, `PieChartStrategy`, or `TableOnlyStrategy`. |
+| Participating classes | `DataSourceFactory.create(paths)` returns `SQLiteDataSource` or `CsvDataSource`. `LLMProviderFactory.create(name)` returns `GeminiAdapter`, `GroqAdapter`, `OllamaAdapter`, or `MockLLMProvider`. `ExporterFactory.create(fmt)` returns `MarkdownExporter`, `HtmlExporter`, or `PdfExporter`. `ChartFactory.create(result, hint)` returns the first fitting chart class: `LineChart`, `BarChart`, `ScatterChart`, `PieChart`, or `TableChart`. |
 | Roles | Each factory is the creator. The interfaces (`DataSource`, `LLMProvider`, `ReportExporter`, and the chart classes) are the products. `ChartRecommender` asks `ChartFactory` for a chart and does not choose the class itself. |
 | Why appropriate | Creation logic lives in one place, so the facade, the CLI, and the benchmark runner never need to know concrete class names. |
 | Without it | Checks such as "if the path ends with .csv" or "if this result is a time series" would be repeated in the facade and the agent, and adding a source, provider, format, or chart would mean finding every place objects are created. |
@@ -1445,19 +1445,19 @@ flowchart LR
     files["«actor»<br/>Data Files<br/>(SQLite, CSV)"]
 
     subgraph sys["AskDB System"]
-        UC01(["UC01 Import Dataset"])
-        UC02(["UC02 Explore Schema"])
-        UC03(["UC03 Ask Question in Natural Language"])
-        UC04(["UC04 Clarify Ambiguous Question"])
-        UC05(["UC05 Ask Follow Up Question"])
-        UC06(["UC06 Validate Query"])
-        UC07(["UC07 Repair Failed Query"])
-        UC08(["UC08 Review and Edit SQL"])
-        UC09(["UC09 Manage History and Saved Questions"])
-        UC10(["UC10 Manage Dashboard"])
-        UC11(["UC11 Export Report"])
-        UC12(["UC12 Configure Models and View Usage"])
-        UC13(["UC13 Run Accuracy Evaluation"])
+        UC01@{ shape: oval, label: "UC01 Import Dataset" }
+        UC02@{ shape: oval, label: "UC02 Explore Schema" }
+        UC03@{ shape: oval, label: "UC03 Ask Question in Natural Language" }
+        UC04@{ shape: oval, label: "UC04 Clarify Ambiguous Question" }
+        UC05@{ shape: oval, label: "UC05 Ask Follow Up Question" }
+        UC06@{ shape: oval, label: "UC06 Validate Query" }
+        UC07@{ shape: oval, label: "UC07 Repair Failed Query" }
+        UC08@{ shape: oval, label: "UC08 Review and Edit SQL" }
+        UC09@{ shape: oval, label: "UC09 Manage History and Saved Questions" }
+        UC10@{ shape: oval, label: "UC10 Manage Dashboard" }
+        UC11@{ shape: oval, label: "UC11 Export Report" }
+        UC12@{ shape: oval, label: "UC12 Configure Models and View Usage" }
+        UC13@{ shape: oval, label: "UC13 Run Accuracy Evaluation" }
     end
 
     analyst --- UC01
@@ -1491,7 +1491,7 @@ flowchart LR
     UC13 --- files
 ```
 
-The rounded nodes inside the system boundary are the UML use cases. Solid lines are actor associations. Dashed arrows are «include» and «extend». Mermaid has no use-case oval, so this flowchart is the use-case diagram.
+The ovals inside the system boundary are the UML use cases. Actors are outside that boundary. Solid lines are actor associations. Dashed arrows are «include» and «extend».
 
 **Actors.** The **Data Analyst** is the primary user of all everyday features, including choosing a clarification (UC04). The **Developer / Evaluator** measures and tunes the agent (routing configuration and benchmark evaluation). The **LLM Service** (cloud APIs or the local Ollama server), the **Embedding Model**, and the **Data Files** are secondary actors outside the system boundary.
 
@@ -2034,7 +2034,7 @@ sequenceDiagram
     participant QE as QueryExecutor
     participant DS as DataSource
     participant CR as ChartRecommender
-    participant CS as ChartStrategy
+    participant CS as ChartProduct
     participant HR as HistoryRepository
 
     A->>MW: edit SQL and press Run
@@ -2339,7 +2339,7 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 | F05 Query Safety Guard | Allow only single, read only, bounded queries | Deterministic | UC06 Validate Query | SqlValidator, SqlRule, SqlRuleDecorator, SingleStatementRule, ReadOnlyRule, ForbiddenObjectRule, RowLimitRule, RunQueryTool, QueryExecutor, SQLiteDataSource | `validate()`, `check()`, `run()` | SD03, SD05 | Decorator |
 | F06 Self Correcting Query Repair | Recover from failing or suspicious queries | Hybrid | UC07 Repair Failed Query | AgentOrchestrator, PromptBuilder, ModelRouter, CheapFirstPolicy, ResponseParser, ColumnValuesTool, RunQueryTool | `handle_failure()`, `build_repair_prompt()`, `complete()`, `select()`, `distinct_values()`, `execute()` | SD03 | State, Builder |
 | F07 SQL Review and Manual Editing | Run user edited SQL without the LLM | Deterministic | UC08 Review and Edit SQL | QueryPanel, GuiController, AskDBFacade, SqlValidator, QueryExecutor, ChartRecommender, HistoryRepository | `on_run_sql_clicked()`, `run_manual_sql()`, `validate()`, `run()`, `build()`, `add()` | SD05 | Facade, Decorator |
-| F08 Automatic Chart Generation | Pick and build a suitable chart | Hybrid | UC03 | MakeChartTool, ChartRecommender, ChartFactory, BarChartStrategy, LineChartStrategy, PieChartStrategy, ScatterChartStrategy, TableOnlyStrategy, ChartSpec, ChartView, ChartRenderer, AskDBFacade | `execute()`, `build()`, `create()`, `recommend()`, `suits()`, `render()`, `to_image()`, `build_chart()` | SD02, SD05 | Factory |
+| F08 Automatic Chart Generation | Pick and build a suitable chart | Hybrid | UC03 | MakeChartTool, ChartRecommender, ChartFactory, BarChart, LineChart, PieChart, ScatterChart, TableChart, ChartSpec, ChartView, ChartRenderer, AskDBFacade | `execute()`, `build()`, `create()`, `recommend()`, `suits()`, `render()`, `to_image()`, `build_chart()` | SD02, SD05 | Factory |
 | F09 Grounded Insight Summary | Summary whose numbers are verified against the result | Hybrid | UC03 | InsightGenerator, PromptBuilder, ModelRouter, ResponseParser, InsightVerifier, Insight, VerificationReport | `generate()`, `build_insight_prompt()`, `complete()`, `parse_insight()`, `verify()` | SD02 | Builder, State |
 | F10 Follow Up Conversation Memory | Refine answers using recent turns | AI | UC05 Ask Follow Up Question | ConversationMemory, Turn, AgentOrchestrator, Planner, AskDBFacade | `context_text()`, `create_plan()`, `add_turn()`, `reset_conversation()`, `clear()` | SD04 | Facade, Builder |
 | F11 Query History and Saved Questions | Search, rerun, and name past questions | Deterministic | UC09 Manage History and Saved Questions | AskDBFacade, HistoryRepository, SavedQuestionRepository, AppDatabase, HistoryEntry, SavedQuestion | `get_history()`, `search()`, `save_question()`, `save()`, `rerun_history()`, `get()` | SD06 | Facade |
@@ -2414,7 +2414,7 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 **Related Use Case:** UC06 Validate Query · **Related Sequence Diagrams:** SD03, SD05
 
 **Classes involved:**
-* `SqlValidator` builds and owns the rule chain.
+* `SqlValidator` builds and owns the stack of rule decorators.
 * `SingleStatementRule`, `ReadOnlyRule`, `ForbiddenObjectRule`, and `RowLimitRule` each enforce one guarantee.
 * `RunQueryTool`, `AskDBFacade`, and `Dashboard` call the validator before any execution.
 * `QueryExecutor` applies the timeout; `SQLiteDataSource` is opened read only as a second layer.
@@ -2457,13 +2457,13 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 **Classes involved:**
 * `MakeChartTool` is invoked by the orchestrator (with the plan's chart hint) or by the model.
-* `ChartRecommender` chooses a strategy.
-* `BarChartStrategy`, `LineChartStrategy`, `PieChartStrategy`, `ScatterChartStrategy`, and `TableOnlyStrategy` decide suitability and build a `ChartSpec`.
+* `ChartRecommender` asks `ChartFactory` for a chart class.
+* `BarChart`, `LineChart`, `PieChart`, `ScatterChart`, and `TableChart` decide suitability and build a `ChartSpec`.
 * `ChartView` displays it; `ChartRenderer` produces images for the CLI and reports.
 
-**Important methods:** `MakeChartTool.execute()`, `ChartRecommender.recommend()`, `ChartFactory.create()`, `ChartStrategy.suits()`, `ChartStrategy.render()`, `ChartRenderer.to_image()`.
+**Important methods:** `MakeChartTool.execute()`, `ChartRecommender.recommend()`, `ChartFactory.create()`, `ChartProduct.suits()`, `ChartProduct.render()`, `ChartRenderer.to_image()`.
 
-**Execution:** During `finalize()`, the orchestrator executes `make_chart` with the hint from the plan. `ChartRecommender` uses the hinted strategy if `suits()` returns true, otherwise the first suitable strategy. The selected strategy's `render()` returns a `ChartSpec`, which travels in the `AgentAnswer` to `ChartView`. When the analyst changes the chart type, `GuiController.on_chart_type_changed()` calls `AskDBFacade.build_chart(result, chart_type)`, which asks `ChartRecommender` for that strategy, so the GUI itself contains no charting logic.
+**Execution:** During `finalize()`, the orchestrator executes `make_chart` with the hint from the plan. `ChartFactory.create()` returns the hinted chart class if `suits()` is true, otherwise the first class that fits. That class's `render()` returns a `ChartSpec`, which travels in the `AgentAnswer` to `ChartView`. When the analyst changes the chart type, `GuiController.on_chart_type_changed()` calls `AskDBFacade.build_chart(result, chart_type)`, which asks `ChartFactory` for that class, so the GUI itself contains no charting logic.
 
 ## F09 Grounded Insight Summary
 
@@ -2539,7 +2539,7 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 **Classes involved:**
 * `LLMProviderFactory` creates provider adapters from configuration.
-* `ModelRouter` (context) and `RoutingPolicy` implementations (strategies) choose the provider per call.
+* `ModelRouter` (context) and `RoutingPolicy` states choose the provider per call.
 * `GeminiAdapter`, `GroqAdapter`, and `OllamaAdapter` call the actual services.
 * `AgentOrchestrator` publishes an `AgentEvent` for every call; `TraceView` and `UsageTracker` observe them.
 
