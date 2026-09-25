@@ -5,7 +5,7 @@
 **Team members:** Krishi Rajeshkumar Shah (220968905)
 **Repository:** https://github.com/krishi-shah/eecs3311-askdb
 
-This report contains the complete Stage 1 design: project overview, feature specifications, UML class diagram, design pattern explanations, use case diagram and descriptions, sequence diagrams, the feature to design traceability table, and an explanation of how every feature is realized. All diagrams are written in Mermaid so they render directly on GitHub and stay under version control with the code in Stages 2 and 3.
+This report contains the complete Stage 1 design: project overview, feature specifications, UML class diagram, design pattern explanations, use case diagram and descriptions, sequence diagrams, the feature to design traceability table, and an explanation of how every feature is realized. All diagrams are written in Mermaid so they render directly on GitHub and stay under version control.
 
 ## Stage 1 deliverable checklist
 
@@ -173,8 +173,6 @@ flowchart TB
 | Charts | matplotlib |
 | LLM access | Google Gen AI Python SDK (Gemini), Groq through its OpenAI compatible endpoint, Ollama HTTP API; all free to use |
 | Application storage | A separate SQLite file for history, saved questions, and dashboards |
-| Deterministic testing (Stage 3) | pytest |
-| Agent behavior testing (Stage 3) | KUMA |
 
 The design itself is language independent. Python was chosen because it has mature libraries for LLM access, embeddings, data handling, and charts.
 
@@ -1396,7 +1394,7 @@ AskDB applies nine design patterns. Eight come from the course list: Facade, Ada
 | Design problem | The LLM decides at runtime which operation to perform. Every operation must be describable to the model, validated before execution, executed in a uniform way, timed, and recorded in the trace. |
 | Participating classes | `Tool` (Command interface); `SearchSchemaTool`, `SampleRowsTool`, `ColumnValuesTool`, `RunQueryTool`, `MakeChartTool`, `AskUserTool` (Concrete commands); `ToolRegistry` (Invoker); `AgentOrchestrator` (Client, turns each parsed `AgentAction` into an invocation); `SchemaIndex`, `DataSource`, `SqlValidator`, `QueryExecutor`, `ChartRecommender` (Receivers). |
 | Roles | Each tool packages a request as an object with a name, description, parameter schema, argument validation, and `execute()`. The registry looks up the tool named in the action, validates the arguments, and runs it. |
-| Why appropriate | The agent's action space becomes a set of interchangeable objects. `ToolRegistry.specs()` generates the tool descriptions for the prompt automatically, and every call is validated and logged in one place, which Stage 3 behavioral testing depends on. |
+| Why appropriate | The agent's action space becomes a set of interchangeable objects. `ToolRegistry.specs()` generates the tool descriptions for the prompt automatically, and every call is validated and logged in one place. |
 | Without it | The orchestrator would need a large switch on tool names with validation and logging repeated in each branch. Adding a tool would require editing the orchestrator and the prompt by hand. |
 
 ## 4.5 Observer
@@ -1406,7 +1404,7 @@ AskDB applies nine design patterns. Eight come from the course list: Facade, Ada
 | Design problem | Several parts of the system must react to agent progress and dashboard changes (the GUI trace and progress list, the CLI progress printer, the usage tracker, the dashboard view), but the agent and the dashboard must not depend on the GUI or CLI. |
 | Participating classes | Agent events: `AgentOrchestrator` (Subject), `AgentEventListener` (Observer interface), `TraceView`, `ConsoleProgressPrinter`, `UsageTracker` (Concrete observers), `AgentEvent` (notification data). Dashboard: `Dashboard` (Subject), `DashboardObserver` (Observer interface), `DashboardView` (Concrete observer). |
 | Roles | Subjects keep a list of observers and call `notify()` whenever something changes. Observers decide independently how to react. |
-| Why appropriate | It keeps the dependency direction correct (presentation depends on the core, never the reverse). New observers, such as a logger for Stage 3 test evidence, can be added without changing the agent. |
+| Why appropriate | It keeps the dependency direction correct (presentation depends on the core, never the reverse). New observers can be added without changing the agent. |
 | Without it | The orchestrator would call GUI methods directly, breaking the layering. The CLI could not reuse the agent, and views would have to poll for changes. |
 
 ## 4.6 Template Method
@@ -2598,12 +2596,12 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 ## 10.2 Key design decisions
 
-1. **The model proposes, the software decides.** The LLM only returns structured JSON. Parsing, argument validation, SQL validation, execution, and number verification are deterministic. This makes the system safe and makes Stage 3 testing clear: deterministic parts get unit tests, agent decisions get behavioral tests.
+1. **The model proposes, the software decides.** The LLM only returns structured JSON. Parsing, argument validation, SQL validation, execution, and number verification are deterministic. This makes the system safe.
 2. **Read only is enforced twice.** The validator only allows reads, and the connection itself is read only. A bug in one layer cannot modify data.
 3. **Every loop is bounded.** Steps, repairs, and clarifications have limits, and repeated SQL is detected, so the agent always terminates with a clear status.
 4. **Answers must be grounded.** A final answer requires a successful query, and every number in the summary is verified against the result.
 5. **Only the relevant schema is sent to the model.** Semantic retrieval keeps prompts small for large databases, and only a few sample rows are ever shared, with a setting to share none.
 6. **A private, offline mode exists.** Local Only routing keeps all data on the machine.
-7. **Evaluation is part of the design.** A built in benchmark runner makes accuracy measurable, so design changes in Stages 2 and 3 can be judged with numbers rather than impressions.
+7. **Evaluation is part of the design.** A built in benchmark runner makes accuracy measurable, so design changes can be judged with numbers rather than impressions.
 8. **Zero cost by design.** Every model is local or on a free tier with no credit card, every library is open source, and rate limits are handled by backoff and fallback rather than by paying for higher tiers. `AgentTrace.to_json()` exports each run so behavior can be tested and analyzed without any paid tooling.
-9. **Design artifacts live with the code.** All diagrams are text (Mermaid) in the repository, so the same repository carries the design, implementation, and tests through all three stages.
+9. **Design artifacts live with the code.** All diagrams are text (Mermaid) in the repository, so the design stays with the project.
