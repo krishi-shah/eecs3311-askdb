@@ -72,7 +72,7 @@ An agent loop fits naturally: the model reasons about the question, chooses a to
 
 **Zero cost policy.** AskDB is designed so that building, testing, and running it never costs money. Every model is either an open weight model running locally through Ollama or a provider's free tier that needs no credit card. No billing account is ever attached to any API key. Free tiers are limited by requests per minute and per day, so `ModelRouter` retries rate limited calls with exponential backoff and then falls back to another free provider, ending with the local model, which has no quota at all. Because some free cloud tiers may use submitted data to improve their models, the cloud tiers are only used with the sample and public benchmark datasets; any private data should be analyzed with the Local Only policy.
 
-The exact models can be changed in configuration without modifying any agent code, because every provider sits behind the `LLMProvider` interface (Adapter pattern) and the choice of provider is made by a `RoutingPolicy` (Strategy pattern).
+The exact models can be changed in configuration without modifying any agent code, because every provider sits behind the `LLMProvider` interface (Adapter pattern) and the choice of provider is made by the current `RoutingPolicy` (State pattern).
 
 ## 1.6 How the AI Model Interacts with the Rest of the System
 
@@ -92,7 +92,7 @@ The guiding rule is: **the model proposes, the software decides.**
 ```mermaid
 flowchart TB
     subgraph P["Presentation Layer"]
-        GUI["GUI (PySide6, MVC)<br/>MainWindow, GuiController, views"]
+        GUI["GUI (PySide6)<br/>MainWindow, GuiController, views"]
         CLI["CLI (Typer)<br/>CliApp, ConsoleProgressPrinter"]
     end
     subgraph A["Application Layer"]
@@ -115,7 +115,7 @@ flowchart TB
         QE["QueryExecutor, SchemaReader"]
     end
     subgraph OUT["Output, Persistence and Evaluation"]
-        CH["ChartRecommender and ChartStrategy"]
+        CH["ChartFactory and chart classes"]
         REPO["Repositories and Dashboard"]
         EX["ReportExporter"]
         EV["BenchmarkRunner"]
@@ -149,11 +149,11 @@ flowchart TB
     DS --> FILES
 ```
 
-**Presentation layer.** The GUI follows MVC. The CLI is a second client. Neither contains business logic; both call `AskDBFacade`.
+**Presentation layer.** The GUI and the CLI are both clients of `AskDBFacade`. Neither contains business logic.
 
 **Application layer.** `AskDBFacade` is the single entry point for all features and owns the current `Session` (data source, schema, schema index, conversation memory, pending clarification).
 
-**Agent core.** `AgentOrchestrator` runs the plan, act, observe loop. `Planner` produces a `QueryPlan`. Tools are Command objects executed by `ToolRegistry`.
+**Agent core.** `AgentOrchestrator` runs the plan, act, observe loop. `Planner` produces a `QueryPlan`. `ToolRegistry` looks up and runs the six tools.
 
 **LLM and retrieval.** `ModelRouter` selects a provider through a `RoutingPolicy` and handles fallback. `SchemaIndex` performs semantic search over the schema.
 
@@ -283,7 +283,7 @@ AskDB has 15 major features. None of them are account or housekeeping operations
 | Input | SQL text. |
 | Output | A `ValidationResult`: valid (possibly rewritten with a `LIMIT`) or rejected with a reason. |
 | AI Involvement | Deterministic. |
-| Expected Workflow | 1. `RunQueryTool` or `AskDBFacade.run_manual_sql()` calls `SqlValidator.validate()`. 2. Each `SqlRule` checks the SQL and passes it to the next rule. 3. If all rules pass, `QueryExecutor.run()` executes it with a timeout. |
+| Expected Workflow | 1. `RunQueryTool` or `AskDBFacade.run_manual_sql()` calls `SqlValidator.validate()`. 2. Each rule decorator adds its check and calls the wrapped rule. 3. If all rules pass, `QueryExecutor.run()` executes it with a timeout. |
 | Error/Alternative Cases | The user asks the agent to "delete the old rows": the agent explains that AskDB is read only and the answer status is `REFUSED`. Multiple statements or statements hidden after a comment: rejected by `SingleStatementRule`. Slow query: cancelled at the timeout and reported to the agent, which may simplify it. Unparseable SQL: returned to the agent as an error for repair (F06). |
 
 ## F06 Self Correcting Query Repair
@@ -319,7 +319,7 @@ AskDB has 15 major features. None of them are account or housekeeping operations
 | Input | `QueryResult` and the chart hint from the `QueryPlan`. |
 | Output | A `ChartSpec` rendered by `ChartView` or saved by `ChartRenderer`. |
 | AI Involvement | Hybrid. The LLM suggests a chart type; deterministic strategies decide whether it suits the data and render it. |
-| Expected Workflow | 1. `MakeChartTool.execute()` calls `ChartRecommender.recommend()`. 2. The hinted strategy is used if `suits()` returns true; otherwise the first suitable strategy is used. 3. `ChartStrategy.render()` returns a `ChartSpec`. 4. The chart is displayed. |
+| Expected Workflow | 1. `MakeChartTool.execute()` calls `ChartRecommender.recommend()`. 2. `ChartFactory.create()` returns the hinted chart class if it fits the result; otherwise it returns the first class that fits. 3. That class builds a `ChartSpec`. 4. The chart is displayed. |
 | Error/Alternative Cases | Unsuitable hint (a pie chart with 40 categories): falls back to bar. A single value result: shown as a value card. No numeric column: table only. Rendering error: the table is shown and the error is logged. |
 
 ## F09 Grounded Insight Summary
@@ -1096,29 +1096,31 @@ classDiagram
         +preview(n: int) QueryResult
     }
     class SqlValidator {
-        -chain: SqlRule
+        -outer: SqlRule
         +validate(sql: str) ValidationResult
     }
     class SqlRule {
         <<abstract>>
-        -next_rule: SqlRule
-        +set_next(rule: SqlRule) SqlRule
         +check(sql: str) ValidationResult
-        #evaluate(sql: str) ValidationResult*
+    }
+    class SqlRuleDecorator {
+        <<abstract>>
+        -wrapped: SqlRule
+        +check(sql: str) ValidationResult
     }
     class ReadOnlyRule {
-        #evaluate(sql: str) ValidationResult
+        +check(sql: str) ValidationResult
     }
     class SingleStatementRule {
-        #evaluate(sql: str) ValidationResult
+        +check(sql: str) ValidationResult
     }
     class ForbiddenObjectRule {
         -forbidden: list
-        #evaluate(sql: str) ValidationResult
+        +check(sql: str) ValidationResult
     }
     class RowLimitRule {
         -max_rows: int
-        #evaluate(sql: str) ValidationResult
+        +check(sql: str) ValidationResult
     }
     class ValidationResult {
         +is_valid: bool
@@ -1137,12 +1139,13 @@ classDiagram
     TableInfo "1" *-- "1..*" ColumnInfo
     QueryExecutor --> DataSource : executes on
     QueryExecutor ..> QueryResult : returns
-    SqlValidator "1" --> "1" SqlRule : head of chain
-    SqlRule --> SqlRule : next_rule
-    SqlRule <|-- ReadOnlyRule
-    SqlRule <|-- SingleStatementRule
-    SqlRule <|-- ForbiddenObjectRule
-    SqlRule <|-- RowLimitRule
+    SqlValidator "1" --> "1" SqlRule : outermost decorator
+    SqlRule <|-- SqlRuleDecorator
+    SqlRuleDecorator o-- SqlRule : wraps
+    SqlRuleDecorator <|-- ReadOnlyRule
+    SqlRuleDecorator <|-- SingleStatementRule
+    SqlRuleDecorator <|-- ForbiddenObjectRule
+    SqlRuleDecorator <|-- RowLimitRule
     SqlRule ..> ValidationResult : returns
 ```
 
@@ -1150,8 +1153,11 @@ classDiagram
 
 ```mermaid
 classDiagram
+    class ChartFactory {
+        +create(result: QueryResult, hint: str) ChartStrategy
+    }
     class ChartRecommender {
-        -strategies: List~ChartStrategy~
+        -factory: ChartFactory
         +recommend(result: QueryResult, hint: str) ChartStrategy
         +build(result: QueryResult, hint: str) ChartSpec
     }
@@ -1299,7 +1305,8 @@ classDiagram
         +to_markdown() str
     }
 
-    ChartRecommender "1" o-- "1..*" ChartStrategy
+    ChartRecommender --> ChartFactory
+    ChartFactory ..> ChartStrategy : creates
     ChartStrategy <|.. BarChartStrategy
     ChartStrategy <|.. LineChartStrategy
     ChartStrategy <|.. PieChartStrategy
@@ -1342,10 +1349,10 @@ classDiagram
 | `LLMProvider` adapters | Hide vendor SDK differences behind one interface |
 | `SchemaIndex` | Semantic search over schema entries using embeddings |
 | `DataSource` / `DataSourceFactory` | Uniform relational access to SQLite and CSV data |
-| `SqlValidator` / `SqlRule` | Deterministic safety chain for all SQL |
+| `SqlValidator` / `SqlRule` | Stack of safety checks around every SQL statement |
 | `QueryExecutor` | Bounded, timed execution of validated SQL |
 | `InsightGenerator` / `InsightVerifier` | Write summaries and check every number against the result |
-| `ChartRecommender` / `ChartStrategy` | Select and build suitable charts |
+| `ChartFactory` / chart classes | Create the chart class that fits a result |
 | `Dashboard` | Holds pinned tiles and notifies views on change |
 | Repositories | Persist history, saved questions, and dashboards |
 | `ReportExporter` | Fixed report generation algorithm with format specific steps |
@@ -1355,7 +1362,7 @@ Note on `QueryPlan.category`: the planner classifies every request as `query`, `
 
 # 4. Design Pattern Explanations
 
-AskDB applies nine design patterns. Eight come from the course list: Facade, Adapter, Strategy, Command, Observer, Template Method, Factory Method, and MVC. The ninth, Chain of Responsibility, is an additional pattern that solves the query safety problem. Each one was chosen because it solves a specific problem in this application, not to reach a count.
+AskDB uses seven patterns taught in the course: Facade, Adapter, Observer, Factory, State, Decorator, and Builder. Each one solves a specific problem in this application. The six tools, the GUI widgets, the history storage classes, and the report writers are ordinary classes. They are not claimed as extra patterns.
 
 ## 4.1 Facade
 
@@ -1377,27 +1384,17 @@ AskDB applies nine design patterns. Eight come from the course list: Facade, Ada
 | Why appropriate | The agent code depends only on `LLMProvider` and `DataSource`, so providers and data formats can be added or swapped without touching the agent. It also allows `MockLLMProvider` to replace real models in tests. |
 | Without it | Vendor specific code would spread through the planner, orchestrator, describer, and insight generator. Supporting local models or a second vendor would mean editing all of them, and deterministic testing of the agent pipeline would be impossible. |
 
-## 4.3 Strategy
+## 4.3 State
 
 | Question | Answer |
 |---|---|
-| Design problem | Two families of algorithms vary and must be chosen at runtime: how to choose a model for each LLM call, and how to visualize a query result. |
-| Participating classes | Routing: `ModelRouter` (Context), `RoutingPolicy` (Strategy), `CheapFirstPolicy`, `StrongOnlyPolicy`, `LocalOnlyPolicy` (Concrete strategies). Charts: `ChartRecommender` (Context), `ChartStrategy` (Strategy), `BarChartStrategy`, `LineChartStrategy`, `PieChartStrategy`, `ScatterChartStrategy`, `TableOnlyStrategy` (Concrete strategies). |
-| Roles | The contexts delegate the decision to the current strategy object. The user changes the routing policy in Settings; the chart strategy is chosen from the result shape and the plan's hint, and the user can switch it. |
-| Why appropriate | Each algorithm is small, independent, and separately testable. New policies or chart types can be added without modifying existing ones (open/closed principle). |
-| Without it | `ModelRouter` and `ChartRecommender` would contain long conditional chains. Adding a policy or chart type would mean editing and retesting existing code, and the evaluation feature could not compare policies cleanly. |
+| Design problem | `ModelRouter` must behave differently depending on the routing mode the user selected: Cheap First, Strong Only, or Local Only. The rest of the agent should not contain that choice. |
+| Participating classes | `ModelRouter` (context); `RoutingPolicy` (state); `CheapFirstPolicy`, `StrongOnlyPolicy`, `LocalOnlyPolicy` (concrete states). |
+| Roles | The router keeps one current state. `select()` is handled by that state. `set_policy()` replaces the state when the user changes Settings. |
+| Why appropriate | Each mode is a small class. Switching mode changes the router's behavior without editing the agent. |
+| Without it | `ModelRouter` would contain a conditional for every mode, and comparing modes in the evaluation feature would mean editing that conditional. |
 
-## 4.4 Command
-
-| Question | Answer |
-|---|---|
-| Design problem | The LLM decides at runtime which operation to perform. Every operation must be describable to the model, validated before execution, executed in a uniform way, timed, and recorded in the trace. |
-| Participating classes | `Tool` (Command interface); `SearchSchemaTool`, `SampleRowsTool`, `ColumnValuesTool`, `RunQueryTool`, `MakeChartTool`, `AskUserTool` (Concrete commands); `ToolRegistry` (Invoker); `AgentOrchestrator` (Client, turns each parsed `AgentAction` into an invocation); `SchemaIndex`, `DataSource`, `SqlValidator`, `QueryExecutor`, `ChartRecommender` (Receivers). |
-| Roles | Each tool packages a request as an object with a name, description, parameter schema, argument validation, and `execute()`. The registry looks up the tool named in the action, validates the arguments, and runs it. |
-| Why appropriate | The agent's action space becomes a set of interchangeable objects. `ToolRegistry.specs()` generates the tool descriptions for the prompt automatically, and every call is validated and logged in one place. |
-| Without it | The orchestrator would need a large switch on tool names with validation and logging repeated in each branch. Adding a tool would require editing the orchestrator and the prompt by hand. |
-
-## 4.5 Observer
+## 4.4 Observer
 
 | Question | Answer |
 |---|---|
@@ -1407,49 +1404,35 @@ AskDB applies nine design patterns. Eight come from the course list: Facade, Ada
 | Why appropriate | It keeps the dependency direction correct (presentation depends on the core, never the reverse). New observers can be added without changing the agent. |
 | Without it | The orchestrator would call GUI methods directly, breaking the layering. The CLI could not reuse the agent, and views would have to poll for changes. |
 
-## 4.6 Template Method
+## 4.5 Factory
 
 | Question | Answer |
 |---|---|
-| Design problem | Reports in Markdown, HTML, and PDF must all follow the same structure and order (header, one section per answer with its chart, footer, save), but each format writes those parts differently. |
-| Participating classes | `ReportExporter` (Abstract class with the template method `export()`); `MarkdownExporter`, `HtmlExporter`, `PdfExporter` (Concrete classes implementing `write_header()`, `write_entry()`, `write_footer()`, `save()`). |
-| Roles | `export()` fixes the algorithm and calls the abstract steps. Subclasses fill in only the format specific steps. |
-| Why appropriate | The report structure is defined once, so all formats stay consistent. A new format needs only its own steps. |
-| Without it | Each exporter would duplicate the ordering logic, formats would drift apart, and a structural change would have to be repeated three times. |
+| Design problem | Which concrete class to create depends on runtime input: the file type being imported, the provider named in configuration, the export format, or the chart that fits a result. Clients should depend only on the product interface. |
+| Participating classes | `DataSourceFactory.create(paths)` returns `SQLiteDataSource` or `CsvDataSource`. `LLMProviderFactory.create(name)` returns `GeminiAdapter`, `GroqAdapter`, `OllamaAdapter`, or `MockLLMProvider`. `ExporterFactory.create(fmt)` returns `MarkdownExporter`, `HtmlExporter`, or `PdfExporter`. `ChartFactory.create(result, hint)` returns the first fitting chart class: `LineChartStrategy`, `BarChartStrategy`, `ScatterChartStrategy`, `PieChartStrategy`, or `TableOnlyStrategy`. |
+| Roles | Each factory is the creator. The interfaces (`DataSource`, `LLMProvider`, `ReportExporter`, and the chart classes) are the products. `ChartRecommender` asks `ChartFactory` for a chart and does not choose the class itself. |
+| Why appropriate | Creation logic lives in one place, so the facade, the CLI, and the benchmark runner never need to know concrete class names. |
+| Without it | Checks such as "if the path ends with .csv" or "if this result is a time series" would be repeated in the facade and the agent, and adding a source, provider, format, or chart would mean finding every place objects are created. |
 
-## 4.7 Factory Method
-
-| Question | Answer |
-|---|---|
-| Design problem | Which concrete class to create depends on runtime input: the file type being imported, the provider named in configuration, or the export format selected by the user. Clients should depend only on interfaces. |
-| Participating classes | `DataSourceFactory.create(paths)` → `SQLiteDataSource` or `CsvDataSource`; `LLMProviderFactory.create(name)` → `GeminiAdapter`, `GroqAdapter`, `OllamaAdapter`, or `MockLLMProvider`; `ExporterFactory.create(fmt)` → one of the three exporters. |
-| Roles | The factories are the creators, the interfaces (`DataSource`, `LLMProvider`, `ReportExporter`) are the products, and the concrete classes are the concrete products. The factory methods are implemented in their parameterized form. |
-| Why appropriate | Creation logic lives in one place per product family, so the facade, the CLI, and the benchmark runner never need to know concrete class names. |
-| Without it | Checks such as "if the path ends with .csv" would be repeated in the facade and the benchmark runner, and adding a new source, provider, or format would require finding and editing every place objects are created. |
-
-## 4.8 Chain of Responsibility
+## 4.6 Decorator
 
 | Question | Answer |
 |---|---|
-| Design problem | Every SQL statement must pass several independent safety checks in a specific order, and a check may either reject the statement or rewrite it (for example by adding a row limit). The checks must be testable one at a time and easy to extend. |
-| Participating classes | `SqlRule` (Handler, abstract); `SingleStatementRule`, `ReadOnlyRule`, `ForbiddenObjectRule`, `RowLimitRule` (Concrete handlers); `SqlValidator` (Client that builds the chain and sends requests to its head); `RunQueryTool`, `AskDBFacade`, `Dashboard` (callers of `SqlValidator`). |
-| Roles | Each rule evaluates the SQL and either stops the chain with a rejection or passes the (possibly rewritten) SQL to the next rule. |
-| Why appropriate | Safety is the most important deterministic guarantee in AskDB. Separate rules make each guarantee explicit, individually testable, and reorderable. |
-| Without it | One large validation method would mix parsing, read only checks, forbidden objects, and limits. It would be hard to test each guarantee alone and easy to break one while changing another. |
+| Design problem | Every SQL statement must pass several independent safety checks, and a check may reject the statement or rewrite it (for example by adding a row limit). Each check must be testable on its own. |
+| Participating classes | `SqlRule` (component); `SingleStatementRule`, `ReadOnlyRule`, `ForbiddenObjectRule`, `RowLimitRule` (concrete decorators, each wrapping the next rule); `SqlValidator` (builds the wrapped stack); `RunQueryTool`, `AskDBFacade`, and `Dashboard` (call `SqlValidator`). |
+| Roles | Each decorator adds one check, then calls the wrapped rule with the original or rewritten SQL. A failure stops there. The outermost rule is what `validate()` calls. |
+| Why appropriate | Safety stays a set of small wrappers. A new check is a new decorator around the existing stack. |
+| Without it | One validation method would mix parsing, read only checks, forbidden objects, and limits. Changing one check could break the others. |
 
-## 4.9 Model View Controller (MVC)
+## 4.7 Builder
 
 | Question | Answer |
 |---|---|
-| Design problem | The GUI must display and edit complex state (schema, answers, dashboard, trace) without mixing user interface code with application logic. |
-| Participating classes | Model: domain objects returned through `AskDBFacade` (`SchemaInfo`, `AgentAnswer`, `QueryResult`, `ChartSpec`, `Dashboard`, `UsageSummary`, `EvaluationReport`). View: `MainWindow`, `QueryPanel`, `SchemaView`, `ResultView`, `ChartView`, `DashboardView`, `TraceView`, `EvaluationView`. Controller: `GuiController`. |
-| Roles | Views render model objects and forward user actions to the controller. The controller calls the facade and tells the views to update. |
-| Why appropriate | It keeps widgets free of business logic, which lets the CLI reuse the same model and facade, and makes the logic testable without a GUI. |
-| Without it | Logic would live inside Qt event handlers, could not be reused by the CLI, and could only be tested by clicking through the interface. |
-
-## 4.10 Supporting Architectural Pattern: Repository
-
-`HistoryRepository`, `SavedQuestionRepository`, and `DashboardRepository` hide all SQL for the application database behind simple methods such as `add()`, `get()`, `search()`, `save()`, and `load()`. It is not counted among the patterns above, but it keeps persistence details out of the facade and the domain objects.
+| Design problem | Every prompt is a complex object assembled the same way: a system instruction, the question, schema hits or tool results, and a required JSON shape. The parts differ for planning, a tool step, a repair, an insight, and a schema description. |
+| Participating classes | `PromptBuilder` (builder); `Planner`, `AgentOrchestrator`, `SchemaDescriber`, and `InsightGenerator` (directors that ask for one kind of prompt). |
+| Roles | `PromptBuilder` exposes one build method per prompt kind (`build_plan_prompt`, `build_step_prompt`, `build_repair_prompt`, `build_insight_prompt`, `build_description_prompt`). Each method assembles the message list. Callers do not concatenate prompt text themselves. |
+| Why appropriate | Prompt wording lives in one class, so a change to the JSON contract is made once. |
+| Without it | The planner, orchestrator, describer, and insight generator would each assemble their own prompt strings, and those strings would drift apart. |
 
 # 5. Use Case Diagram
 
@@ -2349,21 +2332,21 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 | Feature | Description | Type | Related Use Case | Classes | Key Methods | Sequence Diagram | Design Pattern(s) |
 |---|---|---|---|---|---|---|---|
-| F01 Dataset Import | Load SQLite or CSV data into a read only session | Deterministic | UC01 Import Dataset | MainWindow, GuiController, AskDBFacade, DataSourceFactory, SQLiteDataSource, CsvDataSource, TypeInferrer, SchemaReader, Session | `on_import_clicked()`, `import_dataset()`, `create()`, `connect()`, `read()` | SD01 | Facade, Factory Method, Adapter |
-| F02 Schema Explorer | Annotated schema view and semantic schema index | Hybrid | UC01, UC02 Explore Schema | SchemaDescriber, PromptBuilder, ModelRouter, ResponseParser, SchemaIndex, LocalEmbeddingProvider, SchemaView | `describe()`, `build_description_prompt()`, `complete()`, `parse_descriptions()`, `build()`, `embed()`, `update_entry()`, `render()` | SD01 | Adapter, Strategy, MVC |
-| F03 Natural Language Question Answering | Agent plans, uses tools, and answers a question | AI | UC03 Ask Question | AskDBFacade, AgentOrchestrator, Planner, SchemaIndex, PromptBuilder, ModelRouter, LLMProvider, ResponseParser, ToolRegistry, SearchSchemaTool, SampleRowsTool, RunQueryTool, QueryExecutor | `ask()`, `run()`, `create_plan()`, `search()`, `build_step_prompt()`, `complete()`, `parse_action()`, `execute()`, `finalize()` | SD02 | Facade, Command, Strategy, Adapter, Observer |
-| F04 Ambiguity Clarification | Ask the user when a question has several meanings | AI | UC04 Clarify Ambiguous Question | AgentOrchestrator, Planner, AskUserTool, Session, ClarificationRequest, MainWindow, GuiController | `create_plan()`, `execute()`, `show_clarification()`, `on_clarification_chosen()`, `answer_clarification()`, `resume()` | SD04 | Command, Facade |
-| F05 Query Safety Guard | Allow only single, read only, bounded queries | Deterministic | UC06 Validate Query | SqlValidator, SqlRule, SingleStatementRule, ReadOnlyRule, ForbiddenObjectRule, RowLimitRule, RunQueryTool, QueryExecutor, SQLiteDataSource | `validate()`, `check()`, `evaluate()`, `run()` | SD03, SD05 | Chain of Responsibility, Command |
-| F06 Self Correcting Query Repair | Recover from failing or suspicious queries | Hybrid | UC07 Repair Failed Query | AgentOrchestrator, PromptBuilder, ModelRouter, CheapFirstPolicy, ResponseParser, ColumnValuesTool, RunQueryTool | `handle_failure()`, `build_repair_prompt()`, `complete()`, `select()`, `distinct_values()`, `execute()` | SD03 | Strategy, Command |
-| F07 SQL Review and Manual Editing | Run user edited SQL without the LLM | Deterministic | UC08 Review and Edit SQL | QueryPanel, GuiController, AskDBFacade, SqlValidator, QueryExecutor, ChartRecommender, HistoryRepository | `on_run_sql_clicked()`, `run_manual_sql()`, `validate()`, `run()`, `build()`, `add()` | SD05 | Facade, Chain of Responsibility, MVC |
-| F08 Automatic Chart Generation | Pick and build a suitable chart | Hybrid | UC03 | MakeChartTool, ChartRecommender, ChartStrategy, BarChartStrategy, LineChartStrategy, PieChartStrategy, ScatterChartStrategy, TableOnlyStrategy, ChartSpec, ChartView, ChartRenderer, AskDBFacade | `execute()`, `build()`, `recommend()`, `suits()`, `render()`, `to_image()`, `build_chart()` | SD02, SD05 | Strategy, Command |
-| F09 Grounded Insight Summary | Summary whose numbers are verified against the result | Hybrid | UC03 | InsightGenerator, PromptBuilder, ModelRouter, ResponseParser, InsightVerifier, Insight, VerificationReport | `generate()`, `build_insight_prompt()`, `complete()`, `parse_insight()`, `verify()` | SD02 | Strategy (model routing) |
-| F10 Follow Up Conversation Memory | Refine answers using recent turns | AI | UC05 Ask Follow Up Question | ConversationMemory, Turn, AgentOrchestrator, Planner, AskDBFacade | `context_text()`, `create_plan()`, `add_turn()`, `reset_conversation()`, `clear()` | SD04 | Facade |
-| F11 Query History and Saved Questions | Search, rerun, and name past questions | Deterministic | UC09 Manage History and Saved Questions | AskDBFacade, HistoryRepository, SavedQuestionRepository, AppDatabase, HistoryEntry, SavedQuestion | `get_history()`, `search()`, `save_question()`, `save()`, `rerun_history()`, `get()` | SD06 | Repository, Facade |
-| F12 Dashboard of Pinned Charts | Pin charts and refresh them together | Deterministic | UC10 Manage Dashboard | Dashboard, DashboardTile, DashboardObserver, DashboardView, DashboardRepository, SqlValidator, QueryExecutor | `pin_to_dashboard()`, `pin()`, `unpin_from_dashboard()`, `unpin()`, `notify()`, `on_dashboard_changed()`, `refresh()`, `save()` | SD06 | Observer, Repository |
-| F13 Report Export | Markdown, HTML, or PDF report of answers | Deterministic | UC11 Export Report | AskDBFacade, ExporterFactory, ReportExporter, MarkdownExporter, HtmlExporter, PdfExporter, ReportData, ChartRenderer, HistoryRepository | `export_report()`, `create()`, `export()`, `write_header()`, `write_entry()`, `write_footer()`, `save()`, `to_image()` | SD07 | Template Method, Factory Method |
-| F14 Model Routing and Usage Monitor | Choose models per call, fall back, and track usage | Hybrid | UC12 Configure Models and View Usage | ModelRouter, RoutingPolicy, CheapFirstPolicy, StrongOnlyPolicy, LocalOnlyPolicy, LLMProviderFactory, GeminiAdapter, GroqAdapter, OllamaAdapter, AgentEvent, UsageTracker, TraceView | `set_routing_policy()`, `create()`, `set_policy()`, `select()`, `complete()`, `fallback()`, `on_event()`, `summary()` | SD08 | Strategy, Adapter, Factory Method, Observer |
-| F15 Accuracy Evaluation | Score the agent against gold SQL | Hybrid | UC13 Run Accuracy Evaluation | CliApp, EvaluationView, AskDBFacade, BenchmarkLoader, BenchmarkRunner, DataSourceFactory, AgentOrchestrator, QueryExecutor, ResultComparator, EvaluationReport | `eval_cmd()`, `run_evaluation()`, `load()`, `run()`, `equivalent()`, `to_markdown()` | SD09 | Facade, Factory Method |
+| F01 Dataset Import | Load SQLite or CSV data into a read only session | Deterministic | UC01 Import Dataset | MainWindow, GuiController, AskDBFacade, DataSourceFactory, SQLiteDataSource, CsvDataSource, TypeInferrer, SchemaReader, Session | `on_import_clicked()`, `import_dataset()`, `create()`, `connect()`, `read()` | SD01 | Facade, Factory, Adapter |
+| F02 Schema Explorer | Annotated schema view and semantic schema index | Hybrid | UC01, UC02 Explore Schema | SchemaDescriber, PromptBuilder, ModelRouter, ResponseParser, SchemaIndex, LocalEmbeddingProvider, SchemaView | `describe()`, `build_description_prompt()`, `complete()`, `parse_descriptions()`, `build()`, `embed()`, `update_entry()`, `render()` | SD01 | Adapter, Builder, Factory |
+| F03 Natural Language Question Answering | Agent plans, uses tools, and answers a question | AI | UC03 Ask Question | AskDBFacade, AgentOrchestrator, Planner, SchemaIndex, PromptBuilder, ModelRouter, LLMProvider, ResponseParser, ToolRegistry, SearchSchemaTool, SampleRowsTool, RunQueryTool, QueryExecutor | `ask()`, `run()`, `create_plan()`, `search()`, `build_step_prompt()`, `complete()`, `parse_action()`, `execute()`, `finalize()` | SD02 | Facade, Builder, State, Adapter, Observer |
+| F04 Ambiguity Clarification | Ask the user when a question has several meanings | AI | UC04 Clarify Ambiguous Question | AgentOrchestrator, Planner, AskUserTool, Session, ClarificationRequest, MainWindow, GuiController | `create_plan()`, `execute()`, `show_clarification()`, `on_clarification_chosen()`, `answer_clarification()`, `resume()` | SD04 | Facade, Builder |
+| F05 Query Safety Guard | Allow only single, read only, bounded queries | Deterministic | UC06 Validate Query | SqlValidator, SqlRule, SqlRuleDecorator, SingleStatementRule, ReadOnlyRule, ForbiddenObjectRule, RowLimitRule, RunQueryTool, QueryExecutor, SQLiteDataSource | `validate()`, `check()`, `run()` | SD03, SD05 | Decorator |
+| F06 Self Correcting Query Repair | Recover from failing or suspicious queries | Hybrid | UC07 Repair Failed Query | AgentOrchestrator, PromptBuilder, ModelRouter, CheapFirstPolicy, ResponseParser, ColumnValuesTool, RunQueryTool | `handle_failure()`, `build_repair_prompt()`, `complete()`, `select()`, `distinct_values()`, `execute()` | SD03 | State, Builder |
+| F07 SQL Review and Manual Editing | Run user edited SQL without the LLM | Deterministic | UC08 Review and Edit SQL | QueryPanel, GuiController, AskDBFacade, SqlValidator, QueryExecutor, ChartRecommender, HistoryRepository | `on_run_sql_clicked()`, `run_manual_sql()`, `validate()`, `run()`, `build()`, `add()` | SD05 | Facade, Decorator |
+| F08 Automatic Chart Generation | Pick and build a suitable chart | Hybrid | UC03 | MakeChartTool, ChartRecommender, ChartFactory, BarChartStrategy, LineChartStrategy, PieChartStrategy, ScatterChartStrategy, TableOnlyStrategy, ChartSpec, ChartView, ChartRenderer, AskDBFacade | `execute()`, `build()`, `create()`, `recommend()`, `suits()`, `render()`, `to_image()`, `build_chart()` | SD02, SD05 | Factory |
+| F09 Grounded Insight Summary | Summary whose numbers are verified against the result | Hybrid | UC03 | InsightGenerator, PromptBuilder, ModelRouter, ResponseParser, InsightVerifier, Insight, VerificationReport | `generate()`, `build_insight_prompt()`, `complete()`, `parse_insight()`, `verify()` | SD02 | Builder, State |
+| F10 Follow Up Conversation Memory | Refine answers using recent turns | AI | UC05 Ask Follow Up Question | ConversationMemory, Turn, AgentOrchestrator, Planner, AskDBFacade | `context_text()`, `create_plan()`, `add_turn()`, `reset_conversation()`, `clear()` | SD04 | Facade, Builder |
+| F11 Query History and Saved Questions | Search, rerun, and name past questions | Deterministic | UC09 Manage History and Saved Questions | AskDBFacade, HistoryRepository, SavedQuestionRepository, AppDatabase, HistoryEntry, SavedQuestion | `get_history()`, `search()`, `save_question()`, `save()`, `rerun_history()`, `get()` | SD06 | Facade |
+| F12 Dashboard of Pinned Charts | Pin charts and refresh them together | Deterministic | UC10 Manage Dashboard | Dashboard, DashboardTile, DashboardObserver, DashboardView, DashboardRepository, SqlValidator, QueryExecutor | `pin_to_dashboard()`, `pin()`, `unpin_from_dashboard()`, `unpin()`, `notify()`, `on_dashboard_changed()`, `refresh()`, `save()` | SD06 | Observer |
+| F13 Report Export | Markdown, HTML, or PDF report of answers | Deterministic | UC11 Export Report | AskDBFacade, ExporterFactory, ReportExporter, MarkdownExporter, HtmlExporter, PdfExporter, ReportData, ChartRenderer, HistoryRepository | `export_report()`, `create()`, `export()`, `write_header()`, `write_entry()`, `write_footer()`, `save()`, `to_image()` | SD07 | Factory |
+| F14 Model Routing and Usage Monitor | Choose models per call, fall back, and track usage | Hybrid | UC12 Configure Models and View Usage | ModelRouter, RoutingPolicy, CheapFirstPolicy, StrongOnlyPolicy, LocalOnlyPolicy, LLMProviderFactory, GeminiAdapter, GroqAdapter, OllamaAdapter, AgentEvent, UsageTracker, TraceView | `set_routing_policy()`, `create()`, `set_policy()`, `select()`, `complete()`, `fallback()`, `on_event()`, `summary()` | SD08 | State, Adapter, Factory, Observer |
+| F15 Accuracy Evaluation | Score the agent against gold SQL | Hybrid | UC13 Run Accuracy Evaluation | CliApp, EvaluationView, AskDBFacade, BenchmarkLoader, BenchmarkRunner, DataSourceFactory, AgentOrchestrator, QueryExecutor, ResultComparator, EvaluationReport | `eval_cmd()`, `run_evaluation()`, `load()`, `run()`, `equivalent()`, `to_markdown()` | SD09 | Facade, Factory |
 
 # 9. Feature Implementation Explanations
 
@@ -2436,9 +2419,9 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 * `RunQueryTool`, `AskDBFacade`, and `Dashboard` call the validator before any execution.
 * `QueryExecutor` applies the timeout; `SQLiteDataSource` is opened read only as a second layer.
 
-**Important methods:** `SqlValidator.validate()`, `SqlRule.check()`, `SqlRule.evaluate()`, `QueryExecutor.run()`.
+**Important methods:** `SqlValidator.validate()`, `SqlRule.check()`, `QueryExecutor.run()`.
 
-**Execution:** Every caller passes SQL to `validate()`, which sends it to the head of the chain. Each rule's `check()` calls its own `evaluate()`; a failure stops the chain with a reason, and success passes the SQL (possibly rewritten with a `LIMIT`) to the next rule. Only a fully valid statement reaches `QueryExecutor.run()`. Requests that are clearly destructive are caught even earlier, when the planner classifies them as `destructive` and the orchestrator refuses without calling tools.
+**Execution:** Every caller passes SQL to `validate()`, which calls the outermost decorator. Each decorator's `check()` adds its own rule and, on success, calls the wrapped rule with the SQL, possibly rewritten with a `LIMIT`. A failure stops there. Only a fully valid statement reaches `QueryExecutor.run()`. Requests that are clearly destructive are caught even earlier, when the planner classifies them as `destructive` and the orchestrator refuses without calling tools.
 
 ## F06 Self Correcting Query Repair
 
@@ -2478,7 +2461,7 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 * `BarChartStrategy`, `LineChartStrategy`, `PieChartStrategy`, `ScatterChartStrategy`, and `TableOnlyStrategy` decide suitability and build a `ChartSpec`.
 * `ChartView` displays it; `ChartRenderer` produces images for the CLI and reports.
 
-**Important methods:** `MakeChartTool.execute()`, `ChartRecommender.build()`, `ChartRecommender.recommend()`, `ChartStrategy.suits()`, `ChartStrategy.render()`, `ChartRenderer.to_image()`.
+**Important methods:** `MakeChartTool.execute()`, `ChartRecommender.recommend()`, `ChartFactory.create()`, `ChartStrategy.suits()`, `ChartStrategy.render()`, `ChartRenderer.to_image()`.
 
 **Execution:** During `finalize()`, the orchestrator executes `make_chart` with the hint from the plan. `ChartRecommender` uses the hinted strategy if `suits()` returns true, otherwise the first suitable strategy. The selected strategy's `render()` returns a `ChartSpec`, which travels in the `AgentAnswer` to `ChartView`. When the analyst changes the chart type, `GuiController.on_chart_type_changed()` calls `AskDBFacade.build_chart(result, chart_type)`, which asks `ChartRecommender` for that strategy, so the GUI itself contains no charting logic.
 
@@ -2585,13 +2568,13 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 | Principle | Where it appears |
 |---|---|
-| Abstraction and interfaces | `LLMProvider`, `DataSource`, `Tool`, `RoutingPolicy`, `ChartStrategy`, `EmbeddingProvider`, `AgentEventListener`, and `DashboardObserver` define what a component does, not how. |
+| Abstraction and interfaces | `LLMProvider`, `DataSource`, `Tool`, `RoutingPolicy`, `ChartFactory`, `EmbeddingProvider`, `AgentEventListener`, and `DashboardObserver` define what a component does, not how. |
 | Encapsulation | `Session` hides current state; `SqlValidator` hides its rule chain; repositories hide all application database SQL; adapters hide vendor SDKs. |
 | Separation of concerns | Presentation, application, agent, LLM access, data and safety, and output are separate layers with one direction of dependency. |
 | High cohesion | Each class has one job: `PromptBuilder` only builds prompts, `ResponseParser` only parses, `QueryExecutor` only executes, `InsightVerifier` only checks numbers. |
 | Low coupling | The GUI and CLI know only `AskDBFacade`. The agent knows tools and providers only through interfaces. |
 | Dependency inversion | High level classes (`AgentOrchestrator`, `Planner`, `ModelRouter`) depend on abstractions that are injected through their constructors, which is what allows `MockLLMProvider` in tests. |
-| Polymorphism | Tools, rules, routing policies, chart strategies, exporters, and data sources are used through their common interface. |
+| Polymorphism | Tools, rules, routing states, chart products, exporters, and data sources are used through their common interface. |
 | Open/closed | New tools, rules, policies, chart types, formats, and providers are added as new classes without modifying existing ones. |
 
 ## 10.2 Key design decisions
