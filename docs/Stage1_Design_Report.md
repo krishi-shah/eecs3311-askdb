@@ -2568,14 +2568,12 @@ In the GUI, the Evaluation tab triggers the same flow through `GuiController.on_
 
 | Principle | Where it appears |
 |---|---|
-| Abstraction and interfaces | `LLMProvider`, `DataSource`, `Tool`, `RoutingPolicy`, `ChartFactory`, `EmbeddingProvider`, `AgentEventListener`, and `DashboardObserver` define what a component does, not how. |
-| Encapsulation | `Session` hides current state; `SqlValidator` hides its rule chain; repositories hide all application database SQL; adapters hide vendor SDKs. |
-| Separation of concerns | Presentation, application, agent, LLM access, data and safety, and output are separate layers with one direction of dependency. |
-| High cohesion | Each class has one job: `PromptBuilder` only builds prompts, `ResponseParser` only parses, `QueryExecutor` only executes, `InsightVerifier` only checks numbers. |
-| Low coupling | The GUI and CLI know only `AskDBFacade`. The agent knows tools and providers only through interfaces. |
-| Dependency inversion | High level classes (`AgentOrchestrator`, `Planner`, `ModelRouter`) depend on abstractions that are injected through their constructors, which is what allows `MockLLMProvider` in tests. |
+| Encapsulation | `Session` hides current state. `SqlValidator` hides the wrapped safety checks. The history classes hide application database SQL. Adapters hide vendor SDKs. |
+| High Cohesion | Each class has one job: `PromptBuilder` only builds prompts, `ResponseParser` only parses, `QueryExecutor` only executes, `InsightVerifier` only checks numbers. |
+| Low Coupling | The GUI and CLI know only `AskDBFacade`. The agent knows tools and providers only through interfaces. |
+| Dependency Inversion Principle | `AgentOrchestrator`, `Planner`, and `ModelRouter` depend on interfaces such as `LLMProvider`, not on a concrete adapter. |
 | Polymorphism | Tools, rules, routing states, chart products, exporters, and data sources are used through their common interface. |
-| Open/closed | New tools, rules, policies, chart types, formats, and providers are added as new classes without modifying existing ones. |
+| Open/Closed Principle | New tools, rules, routing states, chart types, formats, and providers are added as new classes without modifying existing ones. |
 
 ## 10.2 Key design decisions
 
